@@ -1,0 +1,108 @@
+name: Workflow Sanity
+
+on:
+    pull_request:
+        paths:
+            - ".github/workflows/**"
+            - ".github/*.yml"
+            - ".github/*.yaml"
+    push:
+        paths:
+            - ".github/workflows/**"
+            - ".github/*.yml"
+            - ".github/*.yaml"
+
+concurrency:
+    group: workflow-sanity-${{ github.event.pull_request.number || github.sha }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+jobs:
+    no-tabs:
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 10
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Fail on tabs in workflow files
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python - <<'PY'
+                  from __future__ import annotations
+
+                  import pathlib
+                  import sys
+
+                  root = pathlib.Path(".github/workflows")
+                  bad: list[str] = []
+                  for path in sorted(root.rglob("*.yml")):
+                    if b"\t" in path.read_bytes():
+                      bad.append(str(path))
+                  for path in sorted(root.rglob("*.yaml")):
+                    if b"\t" in path.read_bytes():
+                      bad.append(str(path))
+
+                  if bad:
+                    print("Tabs found in workflow file(s):")
+                    for path in bad:
+                      print(f"- {path}")
+                    sys.exit(1)
+                  PY
+
+    actionlint:
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 10
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Lint GitHub workflows
+              uses: rhysd/actionlint@393031adb9afb225ee52ae2ccd7a5af5525e03e8 # v1.7.11
+
+    contributor-tier-consistency:
+        runs-on: blacksmith-2vcpu-ubuntu-2404
+        timeout-minutes: 10
+        steps:
+            - name: Checkout
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - name: Verify contributor-tier parity across workflows
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 - <<'PY'
+                  import re
+                  from pathlib import Path
+
+                  files = [
+                    Path('.github/workflows/labeler.yml'),
+                    Path('.github/workflows/auto-response.yml'),
+                  ]
+
+                  parsed = {}
+                  for path in files:
+                    text = path.read_text(encoding='utf-8')
+                    rules = re.findall(r'\{ label: "([^"]+ contributor)", minMergedPRs: (\d+) \}', text)
+                    color_match = re.search(r'const contributorTierColor = "([0-9A-Fa-f]{6})"', text)
+                    if not color_match:
+                      raise SystemExit(f'failed to parse contributorTierColor in {path}')
+                    parsed[str(path)] = {
+                      'rules': rules,
+                      'color': color_match.group(1).upper(),
+                    }
+
+                  baseline = parsed[str(files[0])]
+                  for path in files[1:]:
+                    entry = parsed[str(path)]
+                    if entry != baseline:
+                      raise SystemExit(
+                        'contributor-tier mismatch between workflows: '
+                        f'{files[0]}={baseline} vs {path}={entry}'
+                      )
+
+                  print('contributor tier rules/color are consistent across label workflows')
+                  PY
