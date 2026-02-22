@@ -35,11 +35,13 @@ Everything is committed, deployed, and working end-to-end.
 
 ### zeroclaw-main — latest
 
-The gateway webhook runs the full agent loop with tools instead of raw LLM chat. Key files:
+The gateway webhook runs the full agent loop with tools instead of raw LLM chat. Native Anthropic tool calling is working end-to-end — MCP tools execute via structured API tool use (not XML fallback). Key files:
 
 - `src/agent/loop_.rs` — `ToolCallRecord` struct, `agent_turn()` and `run_tool_call_loop()` accept optional tool record collection, MCP tools wired into both `run()` and `process_message()`
 - `src/gateway/mod.rs` — `agent_turn()` replaces `simple_chat()` in webhook handler, `GET /info` endpoint, `AppState` includes `mcp_manager`, 120s timeout
 - `src/channels/mod.rs` — passes `None` for new tool_records param
+- `src/providers/anthropic.rs` — `chat_with_tools()` override: converts OpenAI-format tool JSON to Anthropic `NativeToolSpec`, sends via `/v1/messages` with native tool definitions
+- `src/providers/reliable.rs` — `supports_native_tools()` and `chat_with_tools()` delegation to inner provider
 - `src/mcp/` — **MCP client integration** (see below)
 
 1745 tests pass. Pre-existing flaky `memory::lucid` test (timing-dependent, unrelated).
@@ -64,6 +66,10 @@ ZeroClaw can now connect to MCP (Model Context Protocol) servers and expose thei
 **Hardening**: Auto-restart on crash (`auto_restart = true` default) — `StdioTransport` holds spawn config and respawns on EOF, retries once. Graceful shutdown via `with_graceful_shutdown` on gateway ctrl+c. Health monitoring via `McpManager::health_status()` exposed in `/info` endpoint as `mcp_servers` array.
 
 **Wired into**: gateway (`src/gateway/mod.rs`), CLI agent (`src/agent/loop_.rs` `run()`), channel processing (`src/agent/loop_.rs` `process_message()`), config schema, onboard wizard.
+
+**Native tool calling**: The Anthropic provider's `chat_with_tools()` converts OpenAI-format tool JSON (`{"type":"function","function":{...}}`) to Anthropic's `NativeToolSpec` format and sends them via the `/v1/messages` API. `ReliableProvider` delegates `supports_native_tools()` and `chat_with_tools()` to the inner provider. Without these overrides, the agent loop falls back to prompt-based XML tool injection which doesn't parse correctly.
+
+**Verified**: `mcp__filesystem__list_directory` executes end-to-end via gateway webhook — native structured tool calls, 138ms tool execution, results in `tool_calls` array.
 
 ### zeroclaw-chat — committed (`38ef8f6`)
 
@@ -208,7 +214,7 @@ Safari's `webkitSpeechRecognition` requires an OS-level "Speech Recognition" per
 - **Must await NCB writes** — Cloudflare Workers kill async work after response is sent. Fire-and-forget (`promise.then().catch()`) does NOT work.
 - Use `@opennextjs/cloudflare` for deployment. Do not add `export const runtime = 'edge'` to routes.
 - Structured JSON responses, not SSE streaming. Tool calls return after the agent loop completes.
-- **Always use `run.sh`** to start the gateway — it extracts the OAuth token from macOS Keychain.
+- **Always use `run.sh`** to start the gateway — it extracts the Claude Code OAuth token from macOS Keychain (`security find-generic-password -s "Claude Code-credentials"`) and exports it as `ANTHROPIC_OAUTH_TOKEN`. Running `cargo run` directly will fail with "Anthropic credentials not set".
 - NCB data API paths: `/create/<table>`, `/read/<table>` etc. Always include `?Instance=36905_zeroclaw_chat`.
 - **Do not use browser `SpeechRecognition` API** — use `MediaRecorder` + Workers AI Whisper instead (Safari compatibility).
 - Voice reference implementation: `~/aismb` repo (`github.com/elev8tion/aismb`) — VoiceOperator component.
