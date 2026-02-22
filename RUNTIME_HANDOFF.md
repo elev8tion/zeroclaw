@@ -61,6 +61,8 @@ ZeroClaw can now connect to MCP (Model Context Protocol) servers and expose thei
 
 **Design**: Per-tool bridging with zero new dependencies. Disabled by default (`mcp.enabled = false`). Servers that fail to connect are warned and skipped (graceful degradation). Resource-capable servers also get `list_resources` and `read_resource` synthetic tools.
 
+**Hardening**: Auto-restart on crash (`auto_restart = true` default) — `StdioTransport` holds spawn config and respawns on EOF, retries once. Graceful shutdown via `with_graceful_shutdown` on gateway ctrl+c. Health monitoring via `McpManager::health_status()` exposed in `/info` endpoint as `mcp_servers` array.
+
 **Wired into**: gateway (`src/gateway/mod.rs`), CLI agent (`src/agent/loop_.rs` `run()`), channel processing (`src/agent/loop_.rs` `process_message()`), config schema, onboard wizard.
 
 ### zeroclaw-chat — committed (`38ef8f6`)
