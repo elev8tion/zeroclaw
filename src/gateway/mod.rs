@@ -201,6 +201,8 @@ pub struct AppState {
     pub system_prompt: Arc<str>,
     /// Full config for building context
     pub config: Arc<Config>,
+    /// MCP manager for graceful shutdown
+    pub mcp_manager: Option<Arc<crate::mcp::McpManager>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -253,7 +255,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let mut tools_vec = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -266,7 +268,23 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
+
+    // MCP tools
+    let mcp_manager = match crate::mcp::McpManager::create_mcp_tools(&config.mcp).await {
+        Ok((mgr, mcp_tools)) => {
+            if !mcp_tools.is_empty() {
+                tools_vec.extend(mcp_tools);
+            }
+            Some(Arc::new(mgr))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "MCP initialization failed — continuing without MCP tools");
+            None
+        }
+    };
+
+    let tools_registry = Arc::new(tools_vec);
 
     // Build observer for agent loop events
     let observer: Arc<dyn Observer> =
@@ -422,6 +440,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         provider_name,
         system_prompt,
         config,
+        mcp_manager,
     };
 
     // Build router with middleware
@@ -460,10 +479,7 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// GET /info — runtime capabilities (protected by pairing)
-async fn handle_info(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_info(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     // ── Bearer token auth (pairing) ──
     if state.pairing.require_pairing() {
         let auth = headers
@@ -660,10 +676,7 @@ async fn handle_webhook(
                     .collect();
                 history.insert(
                     0,
-                    ChatMessage::system(format!(
-                        "[Memory context]\n{}",
-                        context.join("\n")
-                    )),
+                    ChatMessage::system(format!("[Memory context]\n{}", context.join("\n"))),
                 );
             }
         }
@@ -1151,6 +1164,7 @@ mod tests {
             provider_name: "mock".into(),
             system_prompt: Arc::from("You are a helpful assistant."),
             config: Arc::new(Config::default()),
+            mcp_manager: None,
         }
     }
 

@@ -52,6 +52,7 @@ pub mod health;
 pub mod heartbeat;
 pub mod identity;
 pub mod integrations;
+pub mod mcp;
 pub mod memory;
 pub mod migration;
 pub mod observability;

@@ -53,6 +53,7 @@ mod health;
 mod heartbeat;
 mod identity;
 mod integrations;
+mod mcp;
 mod memory;
 mod migration;
 mod observability;

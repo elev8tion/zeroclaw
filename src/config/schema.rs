@@ -92,6 +92,10 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// MCP (Model Context Protocol) client configuration.
+    #[serde(default)]
+    pub mcp: crate::mcp::config::McpConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -1702,6 +1706,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            mcp: crate::mcp::config::McpConfig::default(),
         }
     }
 }
@@ -2234,6 +2239,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            mcp: crate::mcp::config::McpConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2343,6 +2349,7 @@ tool_dispatcher = "xml"
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            mcp: crate::mcp::config::McpConfig::default(),
         };
 
         config.save().unwrap();

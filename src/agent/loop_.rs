@@ -702,9 +702,7 @@ pub(crate) async fn run_tool_call_loop(
                 tool: call.name.clone(),
             });
             let start = Instant::now();
-            let (result, tool_success) = if let Some(tool) =
-                find_tool(tools_registry, &call.name)
-            {
+            let (result, tool_success) = if let Some(tool) = find_tool(tools_registry, &call.name) {
                 match tool.execute(call.arguments.clone()).await {
                     Ok(r) => {
                         observer.record_event(&ObserverEvent::ToolCall {
@@ -853,6 +851,12 @@ pub async fn run(
     if !peripheral_tools.is_empty() {
         tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
         tools_registry.extend(peripheral_tools);
+    }
+
+    // MCP tools
+    let (_mcp_manager, mcp_tools) = crate::mcp::McpManager::create_mcp_tools(&config.mcp).await?;
+    if !mcp_tools.is_empty() {
+        tools_registry.extend(mcp_tools);
     }
 
     // ── Resolve provider ─────────────────────────────────────────
@@ -1245,6 +1249,12 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
+
+    // MCP tools
+    let (_mcp_manager, mcp_tools) = crate::mcp::McpManager::create_mcp_tools(&config.mcp).await?;
+    if !mcp_tools.is_empty() {
+        tools_registry.extend(mcp_tools);
+    }
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
