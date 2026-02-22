@@ -7,14 +7,16 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+use crate::agent::loop_::{agent_turn, build_tool_instructions, ToolCallRecord};
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, Provider};
+use crate::observability::{self, Observer};
+use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
-use crate::tools;
+use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use axum::{
@@ -36,8 +38,8 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
-pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Request timeout (120s) — agent tool execution needs time
+pub const REQUEST_TIMEOUT_SECS: u64 = 120;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
@@ -189,6 +191,16 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    /// Full tool registry for agent loop execution
+    pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    /// Observer for recording agent events
+    pub observer: Arc<dyn Observer>,
+    /// Provider name for observer events
+    pub provider_name: String,
+    /// Pre-built system prompt with tool instructions
+    pub system_prompt: Arc<str>,
+    /// Full config for building context
+    pub config: Arc<Config>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -241,7 +253,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -255,6 +267,44 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     ));
+
+    // Build observer for agent loop events
+    let observer: Arc<dyn Observer> =
+        Arc::from(observability::create_observer(&config.observability));
+
+    // Build system prompt once (reused per webhook request)
+    let provider_name = config
+        .default_provider
+        .as_deref()
+        .unwrap_or("openrouter")
+        .to_string();
+    let tool_descs: Vec<(&str, &str)> = vec![
+        ("shell", "Execute terminal commands."),
+        ("file_read", "Read file contents."),
+        ("file_write", "Write file contents."),
+        ("memory_store", "Save to memory."),
+        ("memory_recall", "Search memory."),
+        ("memory_forget", "Delete a memory entry."),
+        ("screenshot", "Capture a screenshot."),
+        ("image_info", "Read image metadata."),
+    ];
+    let skills = crate::skills::load_skills(&config.workspace_dir);
+    let bootstrap_max_chars = if config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+    let mut system_prompt = crate::channels::build_system_prompt(
+        &config.workspace_dir,
+        &model,
+        &tool_descs,
+        &skills,
+        Some(&config.identity),
+        bootstrap_max_chars,
+    );
+    system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    let system_prompt: Arc<str> = Arc::from(system_prompt);
+    let config = Arc::new(config);
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -336,6 +386,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
+    println!("  GET  /info      — runtime info (tools, agents, channels)");
     println!("  GET  /health    — health check");
     if let Some(code) = pairing.pairing_code() {
         println!();
@@ -366,11 +417,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        tools_registry,
+        observer,
+        provider_name,
+        system_prompt,
+        config,
     };
 
     // Build router with middleware
     let app = Router::new()
         .route("/health", get(handle_health))
+        .route("/info", get(handle_info))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
@@ -400,6 +457,53 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
+}
+
+/// GET /info — runtime capabilities (protected by pairing)
+async fn handle_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // ── Bearer token auth (pairing) ──
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            let err = serde_json::json!({"error": "Unauthorized"});
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
+    }
+
+    let tool_names: Vec<&str> = state.tools_registry.iter().map(|t| t.name()).collect();
+
+    let delegates: Vec<serde_json::Value> = state
+        .config
+        .agents
+        .iter()
+        .map(|(name, a)| {
+            serde_json::json!({
+                "name": name,
+                "provider": &a.provider,
+                "model": &a.model,
+            })
+        })
+        .collect();
+
+    let channels = serde_json::json!([
+        {"name": "webhook", "status": "active"}
+    ]);
+
+    let body = serde_json::json!({
+        "delegates": delegates,
+        "tools": tool_names,
+        "channels": channels,
+        "model": state.model,
+        "provider": state.provider_name,
+    });
+    (StatusCode::OK, Json(body))
 }
 
 /// POST /pair — exchange one-time code for bearer token
@@ -543,21 +647,59 @@ async fn handle_webhook(
             .await;
     }
 
-    match state
-        .provider
-        .simple_chat(message, &state.model, state.temperature)
-        .await
+    // Build conversation history with system prompt and memory context
+    let mut history = vec![ChatMessage::system(state.system_prompt.as_ref())];
+
+    // Inject memory context if auto_save is enabled
+    if state.auto_save {
+        if let Ok(entries) = state.mem.recall(message, 5, None).await {
+            if !entries.is_empty() {
+                let context: Vec<String> = entries
+                    .iter()
+                    .map(|e| format!("- {}: {}", e.key, e.content))
+                    .collect();
+                history.insert(
+                    0,
+                    ChatMessage::system(format!(
+                        "[Memory context]\n{}",
+                        context.join("\n")
+                    )),
+                );
+            }
+        }
+    }
+
+    history.push(ChatMessage::user(message.to_string()));
+
+    // Run full agent loop with tools
+    let mut tool_records: Vec<ToolCallRecord> = Vec::new();
+    match agent_turn(
+        state.provider.as_ref(),
+        &mut history,
+        &state.tools_registry,
+        state.observer.as_ref(),
+        &state.provider_name,
+        &state.model,
+        state.temperature,
+        true,
+        Some(&mut tool_records),
+    )
+    .await
     {
         Ok(response) => {
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let body = serde_json::json!({
+                "response": response,
+                "model": state.model,
+                "tool_calls": tool_records,
+            });
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
             tracing::error!(
-                "Webhook provider error: {}",
+                "Webhook agent error: {}",
                 providers::sanitize_api_error(&e.to_string())
             );
-            let err = serde_json::json!({"error": "LLM request failed"});
+            let err = serde_json::json!({"error": "Agent request failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }
@@ -746,8 +888,8 @@ mod tests {
     }
 
     #[test]
-    fn security_timeout_is_30_seconds() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    fn security_timeout_is_120_seconds() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 120);
     }
 
     #[test]
@@ -990,17 +1132,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn webhook_idempotency_skips_duplicate_provider_calls() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-
-        let state = AppState {
+    fn test_state(provider: Arc<dyn Provider>, mem: Arc<dyn Memory>) -> AppState {
+        use crate::observability::noop::NoopObserver;
+        AppState {
             provider,
             model: "test-model".into(),
             temperature: 0.0,
-            mem: memory,
+            mem,
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -1008,7 +1146,21 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
-        };
+            tools_registry: Arc::new(Vec::new()),
+            observer: Arc::new(NoopObserver),
+            provider_name: "mock".into(),
+            system_prompt: Arc::from("You are a helpful assistant."),
+            config: Arc::new(Config::default()),
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_idempotency_skips_duplicate_provider_calls() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = test_state(provider, memory);
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("abc-123"));
@@ -1044,19 +1196,8 @@ mod tests {
         let tracking_impl = Arc::new(TrackingMemory::default());
         let memory: Arc<dyn Memory> = tracking_impl.clone();
 
-        let state = AppState {
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: true,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-        };
+        let mut state = test_state(provider, memory);
+        state.auto_save = true;
 
         let headers = HeaderMap::new();
 
@@ -1101,19 +1242,8 @@ mod tests {
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
-        let state = AppState {
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-        };
+        let mut state = test_state(provider, memory);
+        state.webhook_secret_hash = Some(Arc::from(hash_webhook_secret("super-secret")));
 
         let response = handle_webhook(
             State(state),
@@ -1135,19 +1265,8 @@ mod tests {
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
-        let state = AppState {
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-        };
+        let mut state = test_state(provider, memory);
+        state.webhook_secret_hash = Some(Arc::from(hash_webhook_secret("super-secret")));
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Webhook-Secret", HeaderValue::from_static("wrong-secret"));
@@ -1172,19 +1291,8 @@ mod tests {
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
-        let state = AppState {
-            provider,
-            model: "test-model".into(),
-            temperature: 0.0,
-            mem: memory,
-            auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret("super-secret"))),
-            pairing: Arc::new(PairingGuard::new(false, &[])),
-            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-        };
+        let mut state = test_state(provider, memory);
+        state.webhook_secret_hash = Some(Arc::from(hash_webhook_secret("super-secret")));
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Webhook-Secret", HeaderValue::from_static("super-secret"));

@@ -490,9 +490,20 @@ struct ParsedToolCall {
     arguments: serde_json::Value,
 }
 
+/// Record of a tool call execution, used for structured response payloads.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallRecord {
+    pub name: String,
+    pub arguments: serde_json::Value,
+    pub result: String,
+    pub success: bool,
+    pub duration_ms: u64,
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
+/// When `tool_records` is provided, collects structured records of each tool execution.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn agent_turn(
     provider: &dyn Provider,
@@ -503,6 +514,7 @@ pub(crate) async fn agent_turn(
     model: &str,
     temperature: f64,
     silent: bool,
+    tool_records: Option<&mut Vec<ToolCallRecord>>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -515,6 +527,7 @@ pub(crate) async fn agent_turn(
         silent,
         None,
         "channel",
+        tool_records,
     )
     .await
 }
@@ -533,6 +546,7 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    mut tool_records: Option<&mut Vec<ToolCallRecord>>,
 ) -> Result<String> {
     // Build native tool definitions once if the provider supports them.
     let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
@@ -688,7 +702,9 @@ pub(crate) async fn run_tool_call_loop(
                 tool: call.name.clone(),
             });
             let start = Instant::now();
-            let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
+            let (result, tool_success) = if let Some(tool) =
+                find_tool(tools_registry, &call.name)
+            {
                 match tool.execute(call.arguments.clone()).await {
                     Ok(r) => {
                         observer.record_event(&ObserverEvent::ToolCall {
@@ -697,9 +713,12 @@ pub(crate) async fn run_tool_call_loop(
                             success: r.success,
                         });
                         if r.success {
-                            scrub_credentials(&r.output)
+                            (scrub_credentials(&r.output), true)
                         } else {
-                            format!("Error: {}", r.error.unwrap_or_else(|| r.output))
+                            (
+                                format!("Error: {}", r.error.unwrap_or_else(|| r.output)),
+                                false,
+                            )
                         }
                     }
                     Err(e) => {
@@ -708,12 +727,22 @@ pub(crate) async fn run_tool_call_loop(
                             duration: start.elapsed(),
                             success: false,
                         });
-                        format!("Error executing {}: {e}", call.name)
+                        (format!("Error executing {}: {e}", call.name), false)
                     }
                 }
             } else {
-                format!("Unknown tool: {}", call.name)
+                (format!("Unknown tool: {}", call.name), false)
             };
+
+            if let Some(records) = &mut tool_records {
+                records.push(ToolCallRecord {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    result: result.clone(),
+                    success: tool_success,
+                    duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                });
+            }
 
             let _ = writeln!(
                 tool_results,
@@ -1041,6 +1070,7 @@ pub async fn run(
             false,
             Some(&approval_manager),
             "cli",
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -1120,6 +1150,7 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                None,
             )
             .await
             {
@@ -1330,6 +1361,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &model_name,
         config.default_temperature,
         true,
+        None,
     )
     .await
 }
