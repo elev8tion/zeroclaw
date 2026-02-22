@@ -1,4 +1,4 @@
-use super::traits::{ChatMessage, StreamChunk, StreamOptions, StreamResult};
+use super::traits::{ChatMessage, ChatResponse, StreamChunk, StreamOptions, StreamResult};
 use super::Provider;
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -351,6 +351,36 @@ impl Provider for ReliableProvider {
             "All providers/models failed. Attempts:\n{}",
             failures.join("\n")
         )
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        self.providers
+            .first()
+            .map(|(_, p)| p.supports_native_tools())
+            .unwrap_or(false)
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        // Delegate to first provider (no retry across providers for tool calls,
+        // since tool state is conversational and non-idempotent)
+        let (provider_name, provider) = self
+            .providers
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No providers configured"))?;
+
+        provider
+            .chat_with_tools(messages, tools, model, temperature)
+            .await
+            .map_err(|e| {
+                tracing::warn!(provider = provider_name, error = %e, "chat_with_tools failed");
+                e
+            })
     }
 
     fn supports_streaming(&self) -> bool {

@@ -402,6 +402,59 @@ impl Provider for AnthropicProvider {
     fn supports_native_tools(&self) -> bool {
         true
     }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
+            )
+        })?;
+
+        let (system_prompt, native_messages) = Self::convert_messages(messages);
+
+        // Convert OpenAI-format tool JSON to Anthropic NativeToolSpec
+        let native_tools: Vec<NativeToolSpec> = tools
+            .iter()
+            .filter_map(|t| {
+                let func = t.get("function")?;
+                Some(NativeToolSpec {
+                    name: func.get("name")?.as_str()?.to_string(),
+                    description: func.get("description")?.as_str()?.to_string(),
+                    input_schema: func.get("parameters").cloned().unwrap_or(serde_json::json!({"type": "object", "properties": {}})),
+                })
+            })
+            .collect();
+
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            max_tokens: 4096,
+            system: system_prompt,
+            messages: native_messages,
+            temperature,
+            tools: if native_tools.is_empty() { None } else { Some(native_tools) },
+        };
+
+        let req = self
+            .client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&native_request);
+
+        let response = self.apply_auth(req, credential).send().await?;
+        if !response.status().is_success() {
+            return Err(super::api_error("Anthropic", response).await);
+        }
+
+        let native_response: NativeChatResponse = response.json().await?;
+        Ok(Self::parse_native_response(native_response))
+    }
 }
 
 #[cfg(test)]
