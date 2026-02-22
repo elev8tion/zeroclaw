@@ -11,6 +11,7 @@ use transport::{SseTransport, StdioTransport};
 
 use crate::tools::Tool;
 use anyhow::Result;
+use serde_json::json;
 use std::sync::Arc;
 
 /// Manages all MCP server connections and their bridged tools.
@@ -76,6 +77,23 @@ impl McpManager {
             }
         }
     }
+
+    /// Return health status for all connected MCP servers as a JSON value.
+    ///
+    /// Each entry: `{ "server": "<name>", "alive": true/false }`.
+    pub fn health_status(&self) -> serde_json::Value {
+        let statuses: Vec<serde_json::Value> = self
+            .clients
+            .iter()
+            .map(|c| {
+                json!({
+                    "server": c.server_name,
+                    "alive": c.is_alive(),
+                })
+            })
+            .collect();
+        json!(statuses)
+    }
 }
 
 /// Connect to a single MCP server and discover its tools.
@@ -98,7 +116,12 @@ async fn connect_server(
                 .command
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("Stdio transport requires 'command'"))?;
-            Box::new(StdioTransport::spawn(command, &config.args, &config.env)?)
+            Box::new(StdioTransport::spawn(
+                command,
+                &config.args,
+                &config.env,
+                config.auto_restart,
+            )?)
         }
     };
 
@@ -159,5 +182,12 @@ mod tests {
         let (manager, tools) = rt.block_on(McpManager::create_mcp_tools(&config)).unwrap();
         assert!(tools.is_empty());
         assert!(manager.clients.is_empty());
+    }
+
+    #[test]
+    fn health_status_empty_when_no_clients() {
+        let manager = McpManager { clients: vec![] };
+        let status = manager.health_status();
+        assert_eq!(status, json!([]));
     }
 }

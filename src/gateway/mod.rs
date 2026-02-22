@@ -443,6 +443,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         mcp_manager,
     };
 
+    // Grab MCP ref for graceful shutdown before state is moved
+    let mcp_shutdown_ref = state.mcp_manager.clone();
+
     // Build router with middleware
     let app = Router::new()
         .route("/health", get(handle_health))
@@ -458,8 +461,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ));
 
-    // Run the server
-    axum::serve(listener, app).await?;
+    // Run the server with graceful shutdown
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("Gateway shutdown signal received");
+            if let Some(mgr) = mcp_shutdown_ref {
+                mgr.shutdown().await;
+                tracing::info!("MCP servers shut down");
+            }
+        })
+        .await?;
 
     Ok(())
 }
@@ -512,12 +524,19 @@ async fn handle_info(State(state): State<AppState>, headers: HeaderMap) -> impl 
         {"name": "webhook", "status": "active"}
     ]);
 
+    let mcp_status = state
+        .mcp_manager
+        .as_ref()
+        .map(|mgr| mgr.health_status())
+        .unwrap_or_else(|| serde_json::json!([]));
+
     let body = serde_json::json!({
         "delegates": delegates,
         "tools": tool_names,
         "channels": channels,
         "model": state.model,
         "provider": state.provider_name,
+        "mcp_servers": mcp_status,
     });
     (StatusCode::OK, Json(body))
 }
