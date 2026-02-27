@@ -167,4 +167,4 @@ panic = "abort"
 
 [dev-dependencies]
 tokio-test = "0.4"
-tempfile = "3.14"
+tempfile = "3.26"
